@@ -18,6 +18,14 @@ To add a new controller you only need to:
 2. Add an initialization sequence in `usb_hid_thread()`
 3. Add a parser function that converts the controller's HID report to `ScePadData`
 
+### Microsoft Xbox Wireless Adapter
+
+The adapter (VID `045E`, PID `02FE`) is not a USB GIP gamepad: it needs its own radio/firmware transport rather than the normal HID endpoint path. That transport is in `payload/xbox_adapter.c`; `gc_main.c` waits for a paired controller before creating its virtual pad, and `controller_xbox.c` handles the resulting GIP reports.
+
+To include adapter support in a build, put the matching `FW_ACC_00U.bin` at the repository root. The build verifies its SHA-256 and embeds it in the payload. The firmware is intentionally not tracked; without it the adapter is not detected.
+
+Puckbridge presents the Xbox controller as a new device and leaves user assignment to the PS5. Assigning it to the same PS5 user as the DualSense may sign out the existing controller; assigning it to another user keeps both connected.
+
 ---
 
 ## Step 1: Identify the Controller

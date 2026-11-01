@@ -30,6 +30,8 @@
 
 #define XBOX_EP_IN   0x82
 #define XBOX_EP_OUT  0x02
+#define XBOX_EP_IN_ALT  0x81
+#define XBOX_EP_OUT_ALT 0x01
 
 /* GIP command bytes */
 #define GIP_CMD_ACK      0x01
@@ -49,3 +51,9 @@ void xbox_gip_handshake(int fd, struct usb_fs_endpoint *eps);
 int  xbox_handle_packet(int fd, struct usb_fs_endpoint *eps,
                         const uint8_t *buf, uint32_t len,
                         ScePadData *out_pad);
+
+/* Handle a GIP message received through the Microsoft Wireless Adapter. */
+int xbox_handle_wireless_packet(const uint8_t *buf, uint32_t len,
+                                ScePadData *out_pad);
+
+void xbox_wireless_reset(void);

@@ -5,6 +5,7 @@
  * Supports up to MAX_SLOTS (4) simultaneous controllers:
  *   - 8BitDo / Nintendo Switch Pro  (VID=057E PID=2009)
  *   - Xbox One S                    (VID=045E PID=02EA)
+ *   - Xbox Wireless Adapter         (VID=045E PID=02FE)
  *
  * Each detected controller gets its own VDA device + force_bind
  * assignment dialog + VDI injection thread.
@@ -44,6 +45,7 @@
 #include "usb_helpers.h"
 #include "controller_nintendo.h"
 #include "controller_xbox.h"
+#include "xbox_adapter.h"
 #include "controller_steam.h"
 #include "controller_sc2.h"
 #include "sc2_profile.h"
@@ -257,6 +259,9 @@ static void inject_pad(int slot, const ScePadData *pad) {
 #define PID_SWITCH  0x2009u
 #define VID_XBOX    0x045eu
 #define PID_XBOX    0x02eau
+#define PID_XBOX_ALT 0x02e3u
+#define VID_XBOX_ADAPTER 0x045eu
+#define PID_XBOX_ADAPTER 0x02feu
 
 #define MAX_UGEN_DEVS 64
 
@@ -398,6 +403,27 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
         return 1;
     }
 
+    if (have_di && vid==VID_XBOX &&
+        (pid==PID_XBOX || pid==PID_XBOX_ALT)) {
+        gp_log("probe: %s VID=%04x PID=%04x → Xbox One GIP\n",
+               path, vid, pid);
+        *out_vid = VID_XBOX;
+        *out_pid = pid;
+        close(fd);
+        return 1;
+    }
+
+#ifdef HAS_XBOX_WIRELESS_FIRMWARE
+    if (have_di && vid==VID_XBOX_ADAPTER && pid==PID_XBOX_ADAPTER) {
+        gp_log("probe: %s VID=%04x PID=%04x → Xbox Wireless Adapter\n",
+               path, vid, pid);
+        *out_vid = VID_XBOX_ADAPTER;
+        *out_pid = PID_XBOX_ADAPTER;
+        close(fd);
+        return 1;
+    }
+#endif
+
     /* Everything below only ever touches the external bus. */
     if (strncmp(path, "/dev/ugen2.", 11) != 0) { close(fd); return 0; }
 
@@ -465,12 +491,16 @@ static int32_t create_vda_for_slot(int slot) {
     uint64_t dev_id = klog_dequeue_ms(10000);
     if (dev_id) {
         handle = (int32_t)(dev_id & 0xffffffffu);
-        pb_kernel_lock();                     /* game hooks read kernel memory too */
-        int br = shellui_pad_force_bind(dev_id, g_inject_uid);
-        pb_kernel_unlock();
-        g_slots[slot].bind_ok = (br == 0);
-        gp_log("slot[%d] force_bind(0x%llx, 0x%08x) ret=%d\n",
-               slot, (unsigned long long)dev_id, (uint32_t)g_inject_uid, br);
+        if (g_slots[slot].pid == PID_XBOX_ADAPTER) {
+            gp_log("slot[%d] Xbox Wireless Adapter pad left for PS5 user assignment\n", slot);
+        } else {
+            pb_kernel_lock();                 /* game hooks read kernel memory too */
+            int br = shellui_pad_force_bind(dev_id, g_inject_uid);
+            pb_kernel_unlock();
+            g_slots[slot].bind_ok = (br == 0);
+            gp_log("slot[%d] force_bind(0x%llx, 0x%08x) ret=%d\n",
+                   slot, (unsigned long long)dev_id, (uint32_t)g_inject_uid, br);
+        }
     } else if (handle >= 0) {
         gp_log("slot[%d] klog timeout — using direct handle %d\n", slot, handle);
     } else {
@@ -536,6 +566,51 @@ static void sc2_vda_detach(int slot, const char *why) {
     }
 }
 
+static int xbox_adapter_vda_attach(int slot) {
+    int32_t handle;
+
+    g_assign_slot = slot;
+    handle = create_vda_for_slot(slot);
+    if (handle < 0) {
+        g_assign_slot = -1;
+        gp_log("slot[%d] Xbox Wireless Adapter VDA create failed\n", slot);
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_slot_lock);
+    g_slots[slot].handle = handle;
+    g_slots[slot].vdi_ready = 1;
+    g_slots[slot].inject_count = 0;
+    g_slots[slot].confirmed = 0;
+    pthread_mutex_unlock(&g_slot_lock);
+    notify("Puckbridge: Xbox wireless controller connected — press a button to assign");
+    return 1;
+}
+
+static void xbox_adapter_vda_detach(int slot) {
+    ScePadData release;
+    int32_t handle;
+
+    memset(&release, 0, sizeof(release));
+    release.leftStick.x = release.leftStick.y = 128;
+    release.rightStick.x = release.rightStick.y = 128;
+    release.connected = 1;
+    release.quat.w = 1.0f;
+    inject_pad(slot, &release);
+
+    pthread_mutex_lock(&g_slot_lock);
+    handle = g_slots[slot].vdi_ready ? g_slots[slot].handle : -1;
+    g_slots[slot].vdi_ready = 0;
+    g_slots[slot].handle = -1;
+    g_slots[slot].confirmed = 0;
+    pthread_mutex_unlock(&g_slot_lock);
+    if (g_assign_slot == slot) g_assign_slot = -1;
+    if (handle >= 0) {
+        scePadVirtualDeviceDeleteDevice(handle);
+        gp_log("slot[%d] Xbox wireless controller VDA removed\n", slot);
+    }
+}
+
 /* ── USB HID thread ───────────────────────────────────────────────────── */
 /* Single-session: receives slot+path+vid+pid, runs until disconnect, then exits.
  * Manager thread handles re-detection after exit. */
@@ -567,12 +642,28 @@ static void *usb_hid_thread(void *arg) {
     void    *buffers[1]; uint32_t lengths[1];
     int fd = -1, out_opened = 0, sc2_iface = 0;
     int usb_ready_notified = 0;
+    int adapter_connected = 0;
+    int adapter_attach_error_notified = 0;
+    int wireless_adapter = pid == PID_XBOX_ADAPTER;
 
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
            slot, dev_path, vid, pid);
 
+    if (wireless_adapter) {
+        char why[160];
+        xbox_wireless_reset();
+        if (!xbox_adapter_open(dev_path, why, sizeof(why))) {
+            gp_log("slot[%d] Xbox Wireless Adapter init failed: %s\n", slot, why);
+            goto exit_slot;
+        }
+        gp_log("slot[%d] Xbox Wireless Adapter initialized: %s\n", slot, why);
+        notify("Puckbridge: Xbox Wireless Adapter ready — pair the controller");
+        goto main_loop;
+    }
+
     /* ── Xbox One: single-pass ─────────────────────────────────────────── */
-    if (pid == PID_XBOX) {
+    if (pid == PID_XBOX || pid == PID_XBOX_ALT) {
+        uint8_t xbox_in_ep = XBOX_EP_IN;
         fd = open(dev_path, O_RDWR);
         if (fd < 0) { gp_log("slot[%d] Xbox open fail errno=%d\n", slot, errno); goto exit_slot; }
 
@@ -589,11 +680,17 @@ static void *usb_hid_thread(void *arg) {
         fs_open.ep_index=0; fs_open.ep_no=XBOX_EP_IN;
         fs_open.max_bufsize=64; fs_open.max_frames=1;
         if (ioctl(fd,USB_FS_OPEN,&fs_open)!=0){
-            gp_log("slot[%d] Xbox IN fail errno=%d\n",slot,errno);
-            goto uninit_exit;
+            int xbox_errno = errno;
+            fs_open.ep_no = XBOX_EP_IN_ALT;
+            if (ioctl(fd,USB_FS_OPEN,&fs_open)!=0){
+                gp_log("slot[%d] Xbox IN fail ep=0x%02x errno=%d; ep=0x%02x errno=%d\n",
+                       slot, XBOX_EP_IN, xbox_errno, XBOX_EP_IN_ALT, errno);
+                goto uninit_exit;
+            }
+            xbox_in_ep = XBOX_EP_IN_ALT;
         }
         gp_log("slot[%d] Xbox IN ep=0x%02x ok maxpkt=%u\n",
-               slot, XBOX_EP_IN, (unsigned)fs_open.max_packet_length);
+               slot, xbox_in_ep, (unsigned)fs_open.max_packet_length);
 
         buffers[0]=buf; lengths[0]=64;
         eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
@@ -603,7 +700,12 @@ static void *usb_hid_thread(void *arg) {
         fs_open.ep_index=1; fs_open.ep_no=XBOX_EP_OUT;
         fs_open.max_bufsize=64; fs_open.max_frames=1;
         out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
-        gp_log("slot[%d] Xbox OUT ep=0x%02x opened=%d\n", slot, XBOX_EP_OUT, out_opened);
+        if (!out_opened) {
+            fs_open.ep_no = XBOX_EP_OUT_ALT;
+            out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
+        }
+        gp_log("slot[%d] Xbox OUT ep=0x%02x opened=%d\n",
+               slot, out_opened ? fs_open.ep_no : XBOX_EP_OUT, out_opened);
 
         xbox_gip_handshake(fd, eps);
         goto main_loop;
@@ -807,7 +909,7 @@ static void *usb_hid_thread(void *arg) {
     }
 
 main_loop: ;
-    int hs_state = (pid==PID_XBOX || pid==PID_STEAM_WIRED || pid==PID_SC2_PUCK || pid==PID_SC2_WIRED) ? HS_STREAMING : HS_WAIT_81_01;
+    int hs_state = (pid==PID_XBOX || pid==PID_XBOX_ALT || wireless_adapter || pid==PID_STEAM_WIRED || pid==PID_SC2_PUCK || pid==PID_SC2_WIRED) ? HS_STREAMING : HS_WAIT_81_01;
     int sc2_link = 1;
     /* DualSense took back over after a hand-off: the Steam Controller is
      * parked (no virtual pad, hooks see it as off) until its Steam button is
@@ -818,49 +920,94 @@ main_loop: ;
     uint8_t nintendo_seq = 1;
 
     while (1) {
-        memset(buf,0,64);
-        buffers[0]=buf; lengths[0]=64;
-        eps[0].ppBuffer=buffers; eps[0].pLength=lengths;
-        eps[0].aFrames=0; eps[0].status=0;
+        const uint8_t *packet = buf;
+        uint32_t len;
+        if (wireless_adapter) {
+            const unsigned char *message = NULL;
+            int n = xbox_adapter_read(&message);
+            int connected = xbox_adapter_controller_connected();
 
-        memset(&start,0,sizeof(start)); start.ep_index=0;
-        if (ioctl(fd,USB_FS_START,&start)!=0) {
-            if (errno==EBUSY){
-                memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-                usleep(5000);
-            } else if (errno==ENXIO||errno==ENOTTY){
-                gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
-            } else {
-                gp_log("slot[%d] START fatal errno=%d\n",slot,errno); goto reinit;
+            if (connected) {
+                adapter_connected = 1;
+                if (!g_slots[slot].vdi_ready) {
+                    if (!xbox_adapter_vda_attach(slot)) {
+                        if (!adapter_attach_error_notified) {
+                            notify("Puckbridge: could not create Xbox wireless controller");
+                            adapter_attach_error_notified = 1;
+                        }
+                        usleep(500000);
+                        continue;
+                    }
+                    adapter_attach_error_notified = 0;
+                }
+            } else if (adapter_connected) {
+                adapter_connected = 0;
+                adapter_attach_error_notified = 0;
+                xbox_adapter_vda_detach(slot);
+                notify("Puckbridge: Xbox wireless controller disconnected");
             }
-            continue;
-        }
 
-        int ok=0, cerr=0, cw=0;
-        for(cw=0;cw<60;cw++){
-            memset(&complete,0,sizeof(complete)); complete.ep_index=0;
-            if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
-            cerr=errno;
-            if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
-            if(cerr!=EBUSY) break;
-            usleep(500);
-        }
-        if(!ok){
-            memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-            continue;
-        }
-        if(lengths[0]<1) continue;
+            if (n < 0) {
+                if (errno == ENXIO || errno == ENODEV || errno == ENOTTY) {
+                    gp_log("slot[%d] Xbox Wireless Adapter disconnected errno=%d\n",
+                           slot, errno);
+                    goto reinit;
+                }
+                usleep(2000);
+                continue;
+            }
+            if (n == 0) {
+                usleep(1000);
+                continue;
+            }
+            packet = message;
+            len = (uint32_t)n;
+        } else {
+            memset(buf,0,64);
+            buffers[0]=buf; lengths[0]=64;
+            eps[0].ppBuffer=buffers; eps[0].pLength=lengths;
+            eps[0].aFrames=0; eps[0].status=0;
 
-        uint32_t len = lengths[0];
+            memset(&start,0,sizeof(start)); start.ep_index=0;
+            if (ioctl(fd,USB_FS_START,&start)!=0) {
+                if (errno==EBUSY){
+                    memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+                    usleep(5000);
+                } else if (errno==ENXIO||errno==ENOTTY){
+                    gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
+                } else {
+                    gp_log("slot[%d] START fatal errno=%d\n",slot,errno); goto reinit;
+                }
+                continue;
+            }
+
+            int ok=0, cerr=0, cw=0;
+            for(cw=0;cw<60;cw++){
+                memset(&complete,0,sizeof(complete)); complete.ep_index=0;
+                if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
+                cerr=errno;
+                if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
+                if(cerr!=EBUSY) break;
+                usleep(500);
+            }
+            if(!ok){
+                memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+                continue;
+            }
+            if(lengths[0]<1) continue;
+            len = lengths[0];
+        }
 
         ScePadData pad; memset(&pad,0,sizeof(pad)); pad.quat.w=1.0f;
         int injected = 0;
 
-        if (pid == PID_XBOX) {
-            injected = xbox_handle_packet(fd, eps, buf, len, &pad);
+        if (wireless_adapter) {
+            injected = xbox_handle_wireless_packet(packet, len, &pad);
+        } else if (pid == PID_XBOX || pid == PID_XBOX_ALT) {
+            injected = xbox_handle_packet(fd, eps, packet, len, &pad);
         } else if (pid == PID_SC2_PUCK || pid == PID_SC2_WIRED) {
             int was = sc2_link;
-            injected = sc2_handle_packet(buf, len, &pad, &sc2_link);
+            injected = sc2_handle_packet(packet, len, &pad, &sc2_link);
             if (sc2_paused != sc2_pause_seen) {             /* paused or resumed (hold … 5 s) */
                 sc2_pause_seen = sc2_paused;
                 if (sc2_paused) ds_handoff_sc2_session(0);
@@ -933,10 +1080,10 @@ main_loop: ;
                 } else if (sc2_link && !g_slots[slot].vdi_ready) sc2_vda_attach(slot);
             }
         } else if (pid == PID_STEAM_WIRED) {
-            injected = steam_handle_packet(buf, len, &pad);
+            injected = steam_handle_packet(packet, len, &pad);
             if ((++steam_pkts % 1250u) == 0) steam_keepalive(fd);   /* ~every 5s */
         } else {
-            injected = nintendo_handle_packet(fd, eps, buf, len, &hs_state, &nintendo_seq, &pad);
+            injected = nintendo_handle_packet(fd, eps, packet, len, &hs_state, &nintendo_seq, &pad);
         }
 
         if (injected > 0) {
@@ -957,6 +1104,12 @@ main_loop: ;
 
 reinit:
     if (usb_ready_notified) { notify("Puckbridge: slot[%d] controller disconnected", slot); usb_ready_notified=0; }
+    if (wireless_adapter) {
+        if (adapter_connected) xbox_adapter_vda_detach(slot);
+        xbox_wireless_reset();
+        xbox_adapter_close();
+        goto exit_slot;
+    }
     if (pid == PID_SC2_PUCK || pid == PID_SC2_WIRED) { sc2_haptic_available = 0; sc2_menu_open = 0; sc2_gyro_reset(); sc2_battery_reset(); ds_handoff_sc2_session(0); }
     memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
     if (out_opened) {
@@ -1028,13 +1181,15 @@ static void *controller_manager_thread(void *arg) {
             const char *name =
                 (vid==VID_SWITCH && pid==PID_SWITCH) ? "Nintendo Switch Pro / 8BitDo" :
                 (vid==VID_NATIVE && pid==PID_NATIVE) ? "8BitDo Native" :
-                (vid==VID_XBOX   && pid==PID_XBOX)   ? "Xbox One S" :
+                (vid==VID_XBOX   && (pid==PID_XBOX || pid==PID_XBOX_ALT)) ? "Xbox One GIP" :
+                (vid==VID_XBOX_ADAPTER && pid==PID_XBOX_ADAPTER) ? "Xbox Wireless Adapter" :
                 (vid==VID_STEAM  && pid==PID_STEAM_WIRED) ? "Steam Controller (2015)" :
                 (vid==VID_STEAM  && pid==PID_SC2_PUCK)    ? "Steam Controller Puck" :
                 (vid==VID_STEAM  && pid==PID_SC2_WIRED)   ? "Steam Controller (2026)" : "Unknown";
 
             gp_log("manager: %s at %s → slot[%d]\n", name, path, slot);
-            int lazy = (vid==VID_STEAM && (pid==PID_SC2_PUCK || pid==PID_SC2_WIRED));
+            int lazy = (vid==VID_XBOX_ADAPTER && pid==PID_XBOX_ADAPTER) ||
+                       (vid==VID_STEAM && (pid==PID_SC2_PUCK || pid==PID_SC2_WIRED));
             if (!lazy) notify("Puckbridge: %s detected — assign user on screen", name);
 
             /* Claim the slot path before VDA so manager skips it if we retry.
@@ -1074,7 +1229,7 @@ static void *controller_manager_thread(void *arg) {
             usb_thread_arg_t *targ = malloc(sizeof(*targ));
             if (!targ) {
                 gp_log("manager: malloc fail for slot[%d]\n", slot);
-                scePadVirtualDeviceDeleteDevice(handle);
+                if (handle >= 0) scePadVirtualDeviceDeleteDevice(handle);
                 pthread_mutex_lock(&g_slot_lock);
                 g_slots[slot].handle=-1; g_slots[slot].vdi_ready=0;
                 g_slots[slot].usb_active=0; g_slots[slot].dev_path[0]='\0';
@@ -1090,7 +1245,7 @@ static void *controller_manager_thread(void *arg) {
             if (pthread_create(&tid, NULL, usb_hid_thread, targ) != 0) {
                 gp_log("manager: pthread_create fail slot[%d]\n", slot);
                 free(targ);
-                scePadVirtualDeviceDeleteDevice(handle);
+                if (handle >= 0) scePadVirtualDeviceDeleteDevice(handle);
                 pthread_mutex_lock(&g_slot_lock);
                 g_slots[slot].handle=-1; g_slots[slot].vdi_ready=0;
                 g_slots[slot].usb_active=0; g_slots[slot].dev_path[0]='\0';
@@ -1100,7 +1255,8 @@ static void *controller_manager_thread(void *arg) {
                 pthread_detach(tid);
                 gp_log("manager: slot[%d] USB thread started handle=0x%x\n",
                        slot, (uint32_t)handle);
-                notify("Puckbridge: slot[%d] ready — press a button to assign", slot);
+                if (!lazy)
+                    notify("Puckbridge: slot[%d] ready — press a button to assign", slot);
             }
             /* One controller per scan pass — assignment gate blocks the rest
              * until the user confirms this one with a button press. */

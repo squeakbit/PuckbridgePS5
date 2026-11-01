@@ -9,11 +9,8 @@
  * reconnects it, and then the Steam Controller steps aside (powered off, or
  * parked) until its Steam button takes control back.
  *
- * The DualSense's MBus device id is learnt from the system log: its
- * DEVICE_ADDED event (a pad with a battery, unlike our virtual one) or a
- * game's "Open Pad [id, ...]" line. A DualSense gets a new id each time it
- * connects and the old one isn't logged as gone, so the id seen last is the
- * one turned off. */
+ * The physical pad's MBus device id is learned from system logs or, when it
+ * was already connected before logging began, from the ScePad device APIs. */
 
 void ds_handoff_start(void);                  /* load setting */
 void ds_handoff_klog_line(const char *line);  /* every system log line */

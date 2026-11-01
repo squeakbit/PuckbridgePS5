@@ -2,7 +2,7 @@
 
 Play your PS5 with the **Steam Controller (2026)**. Puckbridge is a payload for a jailbroken PS5 that makes the Steam Controller work in real games: rumble, gyro aiming, flick stick, motion controls, adaptive-trigger feedback, full remapping with per-game profiles, and a clean hand-off to and from your DualSense. You set it all up from a web portal on your phone.
 
-Built on [Ghostcontrol](https://github.com/srbraboo/Ghostcontrol-PS5-USB-Controller-Patcher) by StonedModder, which adds USB controllers to the PS5 as a virtual DualSense. Ghostcontrol's original controllers (8BitDo / Switch Pro, Xbox One / Series) still work.
+Built on [Ghostcontrol](https://github.com/srbraboo/Ghostcontrol-PS5-USB-Controller-Patcher) by StonedModder, which adds USB controllers to the PS5 as a virtual DualSense. Ghostcontrol's original controllers (8BitDo / Switch Pro, Xbox One / Series) still work. The Microsoft Xbox Wireless Adapter for Windows is also supported when its firmware is available at build time.
 
 > Not affiliated with Valve or Sony. For use with games you own.
 
@@ -40,6 +40,7 @@ That's it. The recommended settings are on by default; *Settings & help → Quic
 - A jailbroken PS5 with an ELF loader on port **9021**. Tested on firmware **13.60**.
 - A Steam Controller (2026) with its Puck, or a USB-C cable. The original Steam Controller (2015) works over USB.
 - To build it yourself: [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk).
+- To build in Xbox Wireless Adapter support, place `FW_ACC_00U.bin` in the repository root before building. The build verifies its SHA-256 and embeds it in the payload; without the file, the adapter is not enabled. The firmware is not included in this repository.
 
 ## Using it
 
@@ -93,6 +94,8 @@ The portal remembers which page, profile and section you were on, so a reload br
 
 Profiles and settings are plain text files in `/data/ghostpad/`, so you can back them up over FTP.
 
+Xbox One / Series controllers also work through Microsoft's Xbox Wireless Adapter for Windows when its firmware is embedded at build time. Puckbridge presents the Xbox controller as a new device and leaves user assignment to the PS5: assigning it to the same PS5 user as the DualSense may sign out the existing controller, while assigning it to another user keeps both controllers connected.
+
 ## What doesn't work (and why)
 
 - **Adaptive trigger resistance:** the Steam Controller (2026) has plain triggers with no resistance motors, so effects are felt as haptics instead of resistance. This is a hardware limit.
@@ -128,6 +131,7 @@ The payload is written to `payload/ghost-control-ps5.elf`.
 | File | What it does |
 |---|---|
 | `payload/gc_main.c` | USB controller threads, virtual DualSense, main loop |
+| `payload/xbox_adapter.c` | Microsoft Wireless Adapter firmware, radio and GIP transport |
 | `payload/controller_sc2.c` | Steam Controller (2026) reports, pause, battery, power off |
 | `payload/sc2_profile.c`, `sc2_binding.c` | Profiles and Steam Input–style activators |
 | `payload/sc2_gyro.c` | Gyro aiming, gyro buttons and motion controls |
@@ -144,6 +148,7 @@ The payload is written to `payload/ghost-control-ps5.elf`.
 
 - Ghostcontrol virtual DualSense: StonedModder
 - Steam Controller (2026) protocol: the Linux `hid-steam` driver (Vicki Pfau et al.) and SDL
+- Xbox Wireless Adapter transport: [FGG-XSense](https://github.com/squeakbit/FGG-XSense_fork), with radio handling adapted from xone (GPL-2.0-or-later)
 - Game bridge (in `payload/bridge/`): [PoorDS4](https://github.com/ItsBlurf/PoorDS4) by ItsBlurf
 - DualSense hand-off idea: the Manba V2 fork of Ghostcontrol by NikoBellikJR31
 - Steam Controller illustration in the portal: Akhil Moola

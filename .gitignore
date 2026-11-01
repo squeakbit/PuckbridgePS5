@@ -1,3 +1,4 @@
 *.elf
 *.o
 .DS_Store
+/payload/.build/
