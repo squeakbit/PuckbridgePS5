@@ -2,4 +2,4 @@
 *.o
 .DS_Store
 /payload/.build/
-FW_ACC_00U.bin
+*.bin
